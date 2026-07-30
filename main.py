@@ -191,13 +191,19 @@ def agent_loop(client: OpenAI, messages: list[dict]):
             tools=TOOLS,
             max_output_tokens=8192,
         )
+
         messages += response.output
 
-        for item in response.output:
+        tool_calls = [item for item in response.output if item.type == "function_call"]
+        if not tool_calls:
+            return
+
+        for item in tool_calls:
             if item.type == "function_call":
                 print(f"Using tool called: {item.name}")
                 handler = TOOL_HANDLERS[item.name]
                 cmd = json.loads(item.arguments)
+                print(f"Command: {cmd}")
                 output = handler(**cmd)
                 messages.append(
                     {
@@ -222,7 +228,7 @@ def main():
 
         history.append({"role": "user", "content": query})
         agent_loop(client, history)
-        response_content = history[-1]["output"]
+        response_content = history[-1].content[0].text
         print(response_content)
 
 
