@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from pprint import pprint
 
@@ -184,61 +185,85 @@ TOOL_HANDLERS = {
     "glob": run_glob,
 }
 
+HOOKS: dict[str, list[Callable]] = {
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
+
+
+def register_hook(event: str, callback: Callable):
+    HOOKS[event].append(callback)
+
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked '{pattern}' is on the deny list"
-    return None
-
-
-PERMISSION_RULES = [
-    {
-        "tools": ["read_file", "write_file", "edit_file"],
-        "check": lambda args: (
-            not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR)
-        ),
-        "message": "Access outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lambda args: any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
-
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
-
-
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n  {reason}")
-    print(f"  Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
-
-
-def check_permission(item: ResponseOutputItem) -> bool:
+def permission_hook(item: ResponseOutputItem) -> str | None:
     if item.name == "bash":
-        cmd = json.loads(item.arguments).get("command", "")
-        reason = check_deny_list(cmd)
-        if reason:
-            print(f"\n{reason}")
-            return False
-    reason = check_rules(item.name, json.loads(item.arguments))
-    if reason:
-        decision = ask_user(item.name, json.loads(item.arguments), reason)
-        if decision == "deny":
-            return False
-    return True
+        for pattern in DENY_LIST:
+            if pattern in json.loads(item.arguments).get("command", ""):
+                print(f"Blocked: '{pattern}'")
+                return "Permission denied by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in json.loads(item.arguments).get("command", ""):
+                print("Potentially destructive command")
+                print(f"   Tool: {item.name} ({json.loads(item.arguments)})")
+                choice = input("  Allow? [y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    return "Permission denied by user"
+    if item.name in ("read_file", "write_file", "edit_file"):
+        path = json.loads(item.arguments).get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print("Access outside workspace")
+            print(f"   Tool: {item.name} ({json.loads(item.arguments)})")
+            choice = input("  Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
+
+
+def log_hook(item: ResponseOutputItem):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(json.loads(item.arguments).values())[:2])[:60]
+    print(f"[HOOK] {item.name}({args_preview})")
+
+
+def large_output_hook(item: ResponseOutputItem, output: str):
+    """PostToolUse: warn on large output"""
+    if len(str(output)) > 100_000:
+        print(f"[HOOK] Large output from {item.name}: {len(str(output))} chars")
+
+
+def context_inject_hook():
+    print(f"[HOOK] UserPromptSubmit: working in {WORKDIR}")
+
+
+def summary_hook(messages: list):
+    tool_count = sum(
+        1
+        for m in messages
+        for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+        if isinstance(b, dict) and b.get("type") == "function_call_output"
+    )
+    print(f"[HOOK] Stop: session used {tool_count} tool calls.")
+
+
+register_hook("UserPromptSubmit", context_inject_hook)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
+register_hook("Stop", summary_hook)
 
 
 def agent_loop(client: OpenAI, messages: list[dict]):
@@ -251,40 +276,46 @@ def agent_loop(client: OpenAI, messages: list[dict]):
         )
 
         messages += [item.model_dump() for item in response.output]
-        pprint(f"Messages:\n{messages}")
 
         tool_calls: list[ResponseOutputItem] = [
             item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
 
         for item in tool_calls:
             if item.type != "function_call":
                 continue
-            else:
-                if not check_permission(item):
-                    messages.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": item.call_id,
-                            "output": "Permission denied.",
-                        }
-                    )
-                    continue
-
-                print(f"Using tool called: {item.name}")
-                handler = TOOL_HANDLERS[item.name]
-                cmd = json.loads(item.arguments)
-                print(f"Command: {cmd}")
-                output = handler(**cmd)
+            blocked = trigger_hooks("PreToolUse", item)
+            if blocked:
                 messages.append(
                     {
                         "type": "function_call_output",
                         "call_id": item.call_id,
-                        "output": output,
+                        "output": str(blocked),
                     }
                 )
+                continue
+
+            print(f"Using tool called: {item.name}")
+            handler = TOOL_HANDLERS[item.name]
+            cmd = json.loads(item.arguments)
+            print(f"Command: {cmd}")
+            output = handler(**cmd)
+
+            trigger_hooks("PostToolUse", item, output)
+
+            messages.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item.call_id,
+                    "output": output,
+                }
+            )
 
 
 def main():
