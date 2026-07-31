@@ -2,8 +2,10 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from pprint import pprint
 
 from openai import OpenAI
+from openai.types.responses import ResponseOutputItem
 
 SYSTEM = f"You are a coding agent at {os.getcwd}. Use bash to solve tasks. Act, don't explain."
 MODEL = "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL"
@@ -220,8 +222,23 @@ def check_rules(tool_name: str, args: dict) -> str | None:
 def ask_user(tool_name: str, args: dict, reason: str) -> str:
     print(f"\n  {reason}")
     print(f"  Tool: {tool_name}({args})")
-    choice = input("   Allow? ")
-    return choice
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+def check_permission(item: ResponseOutputItem) -> bool:
+    if item.name == "bash":
+        cmd = json.loads(item.arguments).get("command", "")
+        reason = check_deny_list(cmd)
+        if reason:
+            print(f"\n{reason}")
+            return False
+    reason = check_rules(item.name, json.loads(item.arguments))
+    if reason:
+        decision = ask_user(item.name, json.loads(item.arguments), reason)
+        if decision == "deny":
+            return False
+    return True
 
 
 def agent_loop(client: OpenAI, messages: list[dict]):
@@ -233,14 +250,29 @@ def agent_loop(client: OpenAI, messages: list[dict]):
             max_output_tokens=8192,
         )
 
-        messages += response.output
+        messages += [item.model_dump() for item in response.output]
+        pprint(f"Messages:\n{messages}")
 
-        tool_calls = [item for item in response.output if item.type == "function_call"]
+        tool_calls: list[ResponseOutputItem] = [
+            item for item in response.output if item.type == "function_call"
+        ]
         if not tool_calls:
             return
 
         for item in tool_calls:
-            if item.type == "function_call":
+            if item.type != "function_call":
+                continue
+            else:
+                if not check_permission(item):
+                    messages.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": item.call_id,
+                            "output": "Permission denied.",
+                        }
+                    )
+                    continue
+
                 print(f"Using tool called: {item.name}")
                 handler = TOOL_HANDLERS[item.name]
                 cmd = json.loads(item.arguments)
@@ -269,8 +301,9 @@ def main():
 
         history.append({"role": "user", "content": query})
         agent_loop(client, history)
-        response_content = history[-1].content[0].text
-        print(response_content)
+        # response_content = history[-1].content[0].text
+        # print(response_content)
+        pprint(history)
 
 
 if __name__ == "__main__":
