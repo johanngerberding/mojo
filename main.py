@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -8,9 +9,15 @@ from pprint import pprint
 from openai import OpenAI
 from openai.types.responses import ResponseOutputItem
 
-SYSTEM = f"You are a coding agent at {os.getcwd}. Use bash to solve tasks. Act, don't explain."
-MODEL = "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL"
 WORKDIR = Path.cwd()
+MODEL = "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL"
+CURRENT_TODOS: list[dict] = []
+
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}."
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update the status as you go."
+)
 
 # openai way of tool calling
 TOOLS = [
@@ -88,6 +95,29 @@ TOOLS = [
                 }
             },
             "required": ["pattern"],
+        },
+    },
+    {
+        "type": "custom",
+        "name": "todo_write",
+        "description": "Create and manage a task list...",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                    },
+                }
+            },
         },
     },
 ]
@@ -177,12 +207,36 @@ def run_bash(command: str) -> str:
         return f"Error: {e}"
 
 
+def _normalize_todos(todos) -> tuple:
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError, ValueError):
+                return None, "Error: todos must be a list or JSON array string"
+
+
+def run_todo_write(todos: list) -> str:
+    global CURRENT_TODOS
+    CURRENT_TODOS = todos
+
+    lines = ["\n##Current Tasks"]
+    for t in CURRENT_TODOS:
+        icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
+
+
 TOOL_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "todo_write": run_todo_write,
 }
 
 HOOKS: dict[str, list[Callable]] = {
