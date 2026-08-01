@@ -100,7 +100,7 @@ TOOLS = [
     {
         "type": "custom",
         "name": "todo_write",
-        "description": "Create and manage a task list...",
+        "description": "Create and manage a task list for your current coding session.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -216,10 +216,24 @@ def _normalize_todos(todos) -> tuple:
                 todos = ast.literal_eval(todos)
             except (SyntaxError, ValueError):
                 return None, "Error: todos must be a list or JSON array string"
+    if not isinstance(todos, list):
+        return None, "Error: todos must be a list"
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return None, f"Error: todos[{i}] must be an object"
+        if "content" not in t or "status" not in t:
+            return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
+    return todos, None
 
 
 def run_todo_write(todos: list) -> str:
     global CURRENT_TODOS
+    todos, error = _normalize_todos(todos)
+    if error:
+        return error
+
     CURRENT_TODOS = todos
 
     lines = ["\n##Current Tasks"]
@@ -321,7 +335,13 @@ register_hook("Stop", summary_hook)
 
 
 def agent_loop(client: OpenAI, messages: list[dict]):
+    rounds_since_todo = 0
     while True:
+        if rounds_since_todo >= 3 and messages:
+            messages.append(
+                {"role": "user", "content": "<reminder>Update your todos.</reminder>"}
+            )
+            rounds_since_todo = 0
         response = client.responses.create(
             model=MODEL,
             input=messages,
@@ -341,6 +361,7 @@ def agent_loop(client: OpenAI, messages: list[dict]):
                 continue
             return
 
+        rounds_since_todo += 1
         for item in tool_calls:
             if item.type != "function_call":
                 continue
