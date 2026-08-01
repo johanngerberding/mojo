@@ -321,8 +321,7 @@ def summary_hook(messages: list):
     tool_count = sum(
         1
         for m in messages
-        for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-        if isinstance(b, dict) and b.get("type") == "function_call_output"
+        if isinstance(m, dict) and m.get("type") == "function_call_output"
     )
     print(f"[HOOK] Stop: session used {tool_count} tool calls.")
 
@@ -376,10 +375,8 @@ def agent_loop(client: OpenAI, messages: list[dict]):
                 )
                 continue
 
-            print(f"Using tool called: {item.name}")
             handler = TOOL_HANDLERS[item.name]
             cmd = json.loads(item.arguments)
-            print(f"Command: {cmd}")
             output = handler(**cmd)
 
             trigger_hooks("PostToolUse", item, output)
@@ -408,8 +405,7 @@ def main():
         history.append({"role": "user", "content": query})
         agent_loop(client, history)
         # response_content = history[-1].content[0].text
-        # print(response_content)
-        pprint(history)
+        pprint(history[-1]["content"][0]["text"])
 
 
 if __name__ == "__main__":
